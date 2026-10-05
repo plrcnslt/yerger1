@@ -33,6 +33,7 @@ import {
   getPublicMenuItems,
   getPublicSpecialEvents,
   getTenantRoomAvailability,
+  deleteHotelEventProposal,
   publishHotelEventProposal,
   respondHotelEventProposal,
   reviewHotelEventProposal,
@@ -62,6 +63,7 @@ export function createServer() {
   app.post("/api/hotel-event-proposals/review", reviewHotelEventProposal);
   app.post("/api/hotel-event-proposals/respond", respondHotelEventProposal);
   app.post("/api/hotel-event-proposals/publish", publishHotelEventProposal);
+  app.post("/api/hotel-event-proposals/delete", deleteHotelEventProposal);
   app.post("/api/hotel-availability", getTenantRoomAvailability);
   app.post("/api/special-events/bookings/create", createSpecialEventBooking);
   app.post("/api/special-events/bookings/confirm-free", confirmFreeSpecialEventBooking);

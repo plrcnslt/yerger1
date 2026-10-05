@@ -122,11 +122,26 @@ create unique index if not exists menu_carts_one_active_per_user_tenant
 do $$
 declare policy_row record;
 begin
-  for policy_row in select policyname from pg_policies where schemaname = 'public' and tablename in ('menu_carts', 'menu_cart_items')
+  for policy_row in select policyname, tablename from pg_policies where schemaname = 'public' and tablename in ('menu_carts', 'menu_cart_items')
   loop execute format('drop policy if exists %I on public.%I', policy_row.policyname, policy_row.tablename); end loop;
 end;
 $$;
 grant select, insert, update, delete on public.menu_carts, public.menu_cart_items to authenticated;
+create or replace function public.hotel_cart_item_belongs_to_current_user(target_cart_id uuid, target_menu_item_id uuid)
+returns boolean language sql stable security definer set search_path = pg_catalog, public
+as $$
+  select exists (
+    select 1 from public.menu_carts cart
+    join public.menu_items item on item.id = target_menu_item_id
+    where cart.id = target_cart_id
+      and cart.user_id = auth.uid()
+      and cart.organization_id is not null
+      and item.organization_id = cart.organization_id
+      and item.is_published
+  );
+$$;
+revoke all on function public.hotel_cart_item_belongs_to_current_user(uuid,uuid) from public, anon;
+grant execute on function public.hotel_cart_item_belongs_to_current_user(uuid,uuid) to authenticated;
 create policy menu_carts_owner_select on public.menu_carts
   for select to authenticated using (user_id = auth.uid() and organization_id is not null);
 create policy menu_carts_owner_insert on public.menu_carts
@@ -140,33 +155,15 @@ create policy menu_carts_owner_update on public.menu_carts
 create policy menu_carts_owner_delete on public.menu_carts
   for delete to authenticated using (user_id = auth.uid() and organization_id is not null);
 create policy menu_cart_items_owner_select on public.menu_cart_items
-  for select to authenticated using (exists (
-    select 1 from public.menu_carts cart join public.menu_items item on item.id = menu_cart_items.menu_item_id
-     where cart.id = menu_cart_items.cart_id and cart.user_id = auth.uid()
-       and cart.organization_id is not null and item.organization_id = cart.organization_id
-  ));
+  for select to authenticated using (public.hotel_cart_item_belongs_to_current_user(menu_cart_items.cart_id, menu_cart_items.menu_item_id));
 create policy menu_cart_items_owner_insert on public.menu_cart_items
-  for insert to authenticated with check (exists (
-    select 1 from public.menu_carts cart join public.menu_items item on item.id = menu_cart_items.menu_item_id
-     where cart.id = menu_cart_items.cart_id and cart.user_id = auth.uid()
-       and cart.organization_id is not null and item.organization_id = cart.organization_id
-  ));
+  for insert to authenticated with check (public.hotel_cart_item_belongs_to_current_user(menu_cart_items.cart_id, menu_cart_items.menu_item_id));
 create policy menu_cart_items_owner_update on public.menu_cart_items
-  for update to authenticated using (exists (
-    select 1 from public.menu_carts cart join public.menu_items item on item.id = menu_cart_items.menu_item_id
-     where cart.id = menu_cart_items.cart_id and cart.user_id = auth.uid()
-       and cart.organization_id is not null and item.organization_id = cart.organization_id
-  )) with check (exists (
-    select 1 from public.menu_carts cart join public.menu_items item on item.id = menu_cart_items.menu_item_id
-     where cart.id = menu_cart_items.cart_id and cart.user_id = auth.uid()
-       and cart.organization_id is not null and item.organization_id = cart.organization_id
-  ));
+  for update to authenticated
+  using (public.hotel_cart_item_belongs_to_current_user(menu_cart_items.cart_id, menu_cart_items.menu_item_id))
+  with check (public.hotel_cart_item_belongs_to_current_user(menu_cart_items.cart_id, menu_cart_items.menu_item_id));
 create policy menu_cart_items_owner_delete on public.menu_cart_items
-  for delete to authenticated using (exists (
-    select 1 from public.menu_carts cart join public.menu_items item on item.id = menu_cart_items.menu_item_id
-     where cart.id = menu_cart_items.cart_id and cart.user_id = auth.uid()
-       and cart.organization_id is not null and item.organization_id = cart.organization_id
-  ));
+  for delete to authenticated using (public.hotel_cart_item_belongs_to_current_user(menu_cart_items.cart_id, menu_cart_items.menu_item_id));
 
 alter table public.special_event_plans
   add column if not exists organization_id uuid references public.books_organizations(id) on delete restrict;
@@ -685,7 +682,7 @@ begin
 end;
 $$;
 revoke all on public.special_event_plans from public, anon, authenticated;
-grant select, delete on public.special_event_plans to authenticated;
+grant select on public.special_event_plans to authenticated;
 create policy special_event_plans_owner_read on public.special_event_plans
   for select to authenticated using (user_id = auth.uid());
 create policy special_event_plans_hotel_manager_read on public.special_event_plans
@@ -695,8 +692,7 @@ create policy special_event_plans_hotel_manager_read on public.special_event_pla
        and membership.user_id = auth.uid()
        and membership.role in ('owner', 'admin', 'manager')
   ));
-create policy special_event_plans_owner_delete on public.special_event_plans
-  for delete to authenticated using (user_id = auth.uid() and status = 'submitted');
+drop policy if exists special_event_plans_owner_delete on public.special_event_plans;
 
 create or replace function public.is_special_event_platform_manager(target_event_id uuid default null)
 returns boolean language sql stable security definer set search_path = pg_catalog, public
@@ -893,6 +889,32 @@ revoke all on function public.submit_special_event_proposal(uuid,text,text,text,
 revoke all on function public.submit_special_event_proposal_for_tenant(uuid,uuid,uuid,text,text,text,timestamptz,timestamptz,text,uuid,integer,text,text,text,text,boolean,text,numeric,boolean) from public, anon, authenticated;
 grant execute on function public.submit_special_event_proposal_for_tenant(uuid,uuid,uuid,text,text,text,timestamptz,timestamptz,text,uuid,integer,text,text,text,text,boolean,text,numeric,boolean) to service_role;
 
+create or replace function public.delete_special_event_proposal_for_tenant(
+  target_organization_id uuid, target_user_id uuid, target_plan_id uuid
+)
+returns void language plpgsql security definer set search_path = pg_catalog, public
+as $$
+begin
+  if target_organization_id is null or target_user_id is null or not exists (
+    select 1 from public.hotel_tenant_settings settings
+     where settings.organization_id = target_organization_id and settings.is_active
+  ) then
+    raise exception 'Hotel domain is not configured';
+  end if;
+
+  delete from public.special_event_plans
+   where id = target_plan_id
+     and organization_id = target_organization_id
+     and user_id = target_user_id
+     and status = 'submitted';
+  if not found then
+    raise exception 'This event proposal cannot be deleted';
+  end if;
+end;
+$$;
+revoke all on function public.delete_special_event_proposal_for_tenant(uuid,uuid,uuid) from public, anon, authenticated;
+grant execute on function public.delete_special_event_proposal_for_tenant(uuid,uuid,uuid) to service_role;
+
 create or replace function public.review_special_event_proposal_for_tenant(
   target_organization_id uuid, target_user_id uuid, target_plan_id uuid, review_action text,
   suggested_values jsonb default null, review_message text default null
@@ -1065,7 +1087,7 @@ $$;
 create or replace function public.hotel_user_manages_organization(target_organization_id uuid, target_user_id uuid default auth.uid())
 returns boolean language sql stable security definer set search_path = pg_catalog, public
 as $$
-  select target_organization_id is not null and exists (
+  select target_organization_id is not null and target_user_id = auth.uid() and exists (
     select 1 from public.books_memberships membership
      where membership.organization_id = target_organization_id
        and membership.user_id = target_user_id
@@ -1078,7 +1100,7 @@ grant execute on function public.hotel_user_manages_organization(uuid,uuid) to a
 create or replace function public.hotel_user_can_access_task(target_task_id uuid, target_user_id uuid default auth.uid())
 returns boolean language sql stable security definer set search_path = pg_catalog, public
 as $$
-  select exists (
+  select target_user_id = auth.uid() and exists (
     select 1 from public.tasks task
      where task.id = target_task_id and task.organization_id is not null
        and (
@@ -1116,7 +1138,7 @@ end;
 $$;
 revoke all on function public.attach_task_hotel_organization() from public, anon, authenticated;
 drop trigger if exists task_hotel_organization on public.tasks;
-create trigger task_hotel_organization before insert or update of organization_id, created_by, complaint_id
+create trigger task_hotel_organization before insert or update of organization_id, created_by, complaint_id, assigned_to
 on public.tasks for each row execute function public.attach_task_hotel_organization();
 
 alter table public.complaints enable row level security;

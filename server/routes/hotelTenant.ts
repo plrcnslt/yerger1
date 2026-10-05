@@ -211,6 +211,26 @@ export const publishHotelEventProposal: RequestHandler = async (request, respons
   }
 };
 
+export const deleteHotelEventProposal: RequestHandler = async (request, response) => {
+  try {
+    const tenant = await resolveRequestHotelTenant(request);
+    const userId = await getAuthenticatedUserId(request.headers.authorization);
+    const { planId } = request.body as { planId?: unknown };
+    if (!isUuid(planId)) {
+      response.status(400).json({ error: "Event proposal is invalid" });
+      return;
+    }
+    await callTenantRpc("delete_special_event_proposal_for_tenant", {
+      target_organization_id: tenant.organizationId,
+      target_user_id: userId,
+      target_plan_id: planId,
+    });
+    response.json({ success: true });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Unable to delete event proposal" });
+  }
+};
+
 export const submitHotelComplaint: RequestHandler = async (request, response) => {
   try {
     const tenant = await resolveRequestHotelTenant(request);

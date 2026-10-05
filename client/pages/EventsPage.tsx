@@ -758,11 +758,12 @@ const EventsPage: React.FC = () => {
 
   const deletePlan = async (planId: string) => {
     if (!requireAuth()) return;
-    const { error } = await supabase.from("special_event_plans").delete().eq("id", planId).eq("status", "submitted");
-    if (error) setNotice("We could not delete that event proposal.");
-    else {
+    try {
+      await postTenantEventProposal("delete", { planId });
       const { data: authData } = await supabase.auth.getUser();
       if (authData.user) await loadUserData(authData.user.id);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "We could not delete that event proposal.");
     }
   };
 
