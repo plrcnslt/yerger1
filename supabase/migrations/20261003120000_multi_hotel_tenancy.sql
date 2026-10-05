@@ -1188,40 +1188,285 @@ create policy tasks_hotel_member_update on public.tasks
   using (public.hotel_user_manages_organization(organization_id))
   with check (public.hotel_user_manages_organization(organization_id));
 
-do $$
-declare function_source text; replacement_source text; start_at integer; end_at integer;
+create or replace function public.post_paid_menu_order_to_books_v2()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  seller_organization_id uuid;
+  customer_contact_id uuid;
+  invoice_uuid uuid;
+  tax_uuid uuid;
+  customer_name text;
+  customer_email text;
+  customer_phone text;
+  order_subtotal numeric;
+  order_tax numeric;
+  order_currency char(3);
+  tax_percentage numeric;
+  order_date date := coalesce(new.created_at::date, current_date);
 begin
-  function_source := pg_get_functiondef('public.post_paid_menu_order_to_books_v2()'::regprocedure);
-  start_at := strpos(function_source, '  select organization_id into seller_organization_id' || E'\n' || '    from public.books_menu_sales_settings where id = true;');
-  if start_at = 0 then
-    raise exception 'Could not scope menu accounting to the order tenant';
+  if new.payment_status <> 'paid'
+     or not (tg_op = 'INSERT' or old.payment_status is distinct from 'paid')
+     or new.books_invoice_id is not null then
+    return new;
   end if;
-  end_at := strpos(substr(function_source, start_at), '  if seller_organization_id is null then' || E'\n' || '    update public.menu_orders');
-  if end_at = 0 then
-    raise exception 'Could not scope menu accounting to the order tenant';
-  end if;
-  end_at := start_at + end_at - 1;
-  replacement_source := substr(function_source, 1, start_at - 1)
-    || '  seller_organization_id := new.organization_id;' || E'\n\n'
-    || substr(function_source, end_at);
-  execute replacement_source;
 
-  function_source := pg_get_functiondef('public.post_special_event_payment_to_books()'::regprocedure);
-  start_at := strpos(function_source, '  select organization_id into seller_organization_id from public.books_menu_sales_settings');
-  if start_at = 0 then
-    raise exception 'Could not scope event accounting to the event tenant';
+  seller_organization_id := new.organization_id;
+
+  if seller_organization_id is null then
+    update public.menu_orders
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Menu order has no hotel organization'
+     where id = new.id;
+    return new;
   end if;
-  end_at := strpos(substr(function_source, start_at), '  if seller_organization_id is null then' || E'\n' || '    update public.special_event_payments');
-  if end_at = 0 then
-    raise exception 'Could not scope event accounting to the event tenant';
+
+  if exists (
+    select 1
+      from public.menu_order_items order_item
+      join public.menu_items item on item.id = order_item.menu_item_id
+     where order_item.order_id = new.id
+       and item.organization_id is distinct from seller_organization_id
+  ) then
+    update public.menu_orders
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Menu order contains items from another or unmapped hotel'
+     where id = new.id;
+    return new;
   end if;
-  end_at := start_at + end_at - 1;
-  replacement_source := substr(function_source, 1, start_at - 1)
-    || '  seller_organization_id := event_row.organization_id;' || E'\n'
-    || substr(function_source, end_at);
-  execute replacement_source;
+
+  customer_name := nullif(trim(concat_ws(' ', new.first_name, new.last_name)), '');
+  customer_email := nullif(trim(new.email), '');
+  customer_phone := nullif(trim(new.phone), '');
+
+  if new.user_id is not null then
+    select first_name, last_name, email, phone
+      into customer_name, customer_email, customer_phone
+      from public.user_profiles up
+     where up.user_id = new.user_id;
+    customer_name := coalesce(customer_name, nullif(trim(concat_ws(' ', new.first_name, new.last_name)), ''));
+    customer_email := coalesce(customer_email, nullif(trim(new.email), ''));
+    customer_phone := coalesce(customer_phone, nullif(trim(new.phone), ''));
+  end if;
+
+  if customer_email is null then
+    update public.menu_orders
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'A customer email is required for the Books invoice'
+     where id = new.id;
+    return new;
+  end if;
+
+  order_tax := coalesce(new.tax_amount, 0);
+  order_subtotal := coalesce(new.subtotal, new.total_amount - order_tax);
+  order_currency := upper(coalesce(new.currency, 'USD'))::char(3);
+
+  select id
+    into customer_contact_id
+    from public.books_contacts
+   where organization_id = seller_organization_id
+     and lower(email) = lower(customer_email)
+     and type in ('customer', 'both')
+   order by created_at
+   limit 1;
+
+  if customer_contact_id is null then
+    insert into public.books_contacts (organization_id, name, type, email, phone)
+    values (seller_organization_id, coalesce(customer_name, customer_email), 'customer', customer_email, customer_phone)
+    returning id into customer_contact_id;
+  else
+    update public.books_contacts
+       set name = coalesce(customer_name, name),
+           phone = coalesce(customer_phone, phone),
+           updated_at = now()
+     where id = customer_contact_id;
+  end if;
+
+  if order_tax > 0 and order_subtotal > 0 then
+    tax_percentage := round(order_tax / order_subtotal * 100, 4);
+    insert into public.books_tax_rates (organization_id, country_code, name, rate_percentage)
+    values (seller_organization_id, 'UG', 'Menu sale tax ' || tax_percentage || '%', tax_percentage)
+    on conflict (organization_id, name, effective_from) do nothing;
+
+    select id
+      into tax_uuid
+      from public.books_tax_rates
+     where organization_id = seller_organization_id
+       and rate_percentage = tax_percentage
+       and is_active
+       and order_date >= effective_from
+       and (effective_to is null or order_date <= effective_to)
+     order by created_at desc
+     limit 1;
+  end if;
+
+  select id
+    into invoice_uuid
+    from public.books_invoices
+   where organization_id = seller_organization_id
+     and invoice_number = 'MENU-' || new.order_number;
+
+  if invoice_uuid is null then
+    insert into public.books_invoices (
+      organization_id, contact_id, invoice_number, issue_date, due_date,
+      currency_code, subtotal, tax_amount, tax_rate_id, status, notes
+    ) values (
+      seller_organization_id, customer_contact_id, 'MENU-' || new.order_number,
+      order_date, order_date, order_currency, order_subtotal, order_tax, tax_uuid,
+      'paid', 'Digital menu order ' || new.order_number || ' (' || new.id || ')'
+    ) returning id into invoice_uuid;
+  end if;
+
+  if not exists (select 1 from public.books_invoice_lines where invoice_id = invoice_uuid) then
+    insert into public.books_invoice_lines (invoice_id, organization_id, description, quantity, unit_price)
+    select invoice_uuid, seller_organization_id, item_name, quantity, unit_price
+      from public.menu_order_items
+     where order_id = new.id;
+  end if;
+
+  update public.menu_orders
+     set books_invoice_id = invoice_uuid,
+         books_accounting_status = 'posted',
+         books_accounting_error = null
+   where id = new.id;
+
+  return new;
+exception when others then
+  update public.menu_orders
+     set books_accounting_status = 'failed',
+         books_accounting_error = left(sqlerrm, 2000)
+   where id = new.id;
+  return new;
 end;
 $$;
+revoke all on function public.post_paid_menu_order_to_books_v2() from public;
+
+create or replace function public.post_special_event_payment_to_books()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  seller_organization_id uuid;
+  customer_contact_id uuid;
+  invoice_uuid uuid;
+  customer_name text;
+  customer_email text;
+  customer_phone text;
+  booking_row public.special_event_bookings%rowtype;
+  event_row public.special_events%rowtype;
+begin
+  if new.status <> 'successful' then
+    return new;
+  end if;
+
+  select * into booking_row
+    from public.special_event_bookings
+   where id = new.booking_id;
+  select * into event_row
+    from public.special_events
+   where id = new.event_id;
+
+  if booking_row.id is null
+     or event_row.id is null
+     or booking_row.event_id is distinct from new.event_id
+     or booking_row.organization_id is distinct from event_row.organization_id then
+    update public.special_event_payments
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Event payment, booking, and event do not share a hotel organization'
+     where id = new.id;
+    update public.special_event_bookings
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Event payment, booking, and event do not share a hotel organization'
+     where id = new.booking_id;
+    return new;
+  end if;
+
+  seller_organization_id := event_row.organization_id;
+  if seller_organization_id is null then
+    update public.special_event_payments
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Event has no hotel organization'
+     where id = new.id;
+    update public.special_event_bookings
+       set books_accounting_status = 'failed',
+           books_accounting_error = 'Event has no hotel organization'
+     where id = new.booking_id;
+    return new;
+  end if;
+
+  customer_name := nullif(trim(concat_ws(' ', booking_row.guest_first_name, booking_row.guest_last_name)), '');
+  customer_email := nullif(trim(booking_row.guest_email), '');
+  customer_phone := nullif(trim(booking_row.guest_phone), '');
+
+  if customer_email is not null then
+    select id into customer_contact_id
+      from public.books_contacts
+     where organization_id = seller_organization_id
+       and lower(email) = lower(customer_email)
+       and type in ('customer', 'both')
+     order by created_at
+     limit 1;
+  end if;
+
+  if customer_contact_id is null then
+    insert into public.books_contacts (organization_id, name, type, email, phone)
+    values (seller_organization_id, coalesce(customer_name, customer_email, 'Event attendee'), 'customer', customer_email, customer_phone)
+    returning id into customer_contact_id;
+  end if;
+
+  select id into invoice_uuid
+    from public.books_invoices
+   where organization_id = seller_organization_id
+     and invoice_number = 'EVENT-' || booking_row.order_number;
+
+  if invoice_uuid is null then
+    insert into public.books_invoices (
+      organization_id, contact_id, invoice_number, issue_date, due_date,
+      currency_code, subtotal, tax_amount, status, notes
+    ) values (
+      seller_organization_id, customer_contact_id, 'EVENT-' || booking_row.order_number,
+      coalesce(new.paid_at::date, current_date), coalesce(new.paid_at::date, current_date),
+      upper(new.currency)::char(3), new.amount, 0, 'paid',
+      'Verified special event payment ' || coalesce(new.transaction_id, new.tx_ref)
+    ) returning id into invoice_uuid;
+
+    insert into public.books_invoice_lines (invoice_id, organization_id, description, quantity, unit_price)
+    values (
+      invoice_uuid, seller_organization_id,
+      event_row.title || ' - ' || booking_row.quantity || ' admission(s)', 1, new.amount
+    );
+  end if;
+
+  update public.special_event_payments
+     set books_invoice_id = invoice_uuid,
+         books_accounting_status = 'posted',
+         books_accounting_error = null
+   where id = new.id;
+  update public.special_event_bookings
+     set books_invoice_id = invoice_uuid,
+         books_accounting_status = 'posted',
+         books_accounting_error = null
+   where id = new.booking_id;
+
+  return new;
+exception when others then
+  update public.special_event_payments
+     set books_accounting_status = 'failed',
+         books_accounting_error = left(sqlerrm, 2000)
+   where id = new.id;
+  update public.special_event_bookings
+     set books_accounting_status = 'failed',
+         books_accounting_error = left(sqlerrm, 2000)
+   where id = new.booking_id;
+  return new;
+end;
+$$;
+revoke all on function public.post_special_event_payment_to_books() from public, anon, authenticated;
 
 notify pgrst, 'reload schema';
 commit;
